@@ -70,6 +70,36 @@ def safe_db_call(fn, *args, **kwargs):
 
 # ── Match Operations ───────────────────────────────────────
 
+def delete_match_data(match_id: int):
+    """
+    Delete all existing data for a match before reprocessing.
+    Order matters: delete children before parents (foreign key constraints).
+    """
+    sb = get_supabase()
+
+    # Delete fight_player_stats (references teamfights)
+    sb.table("fight_player_stats").delete().eq("match_id", match_id).execute()
+
+    # Delete teamfights
+    sb.table("teamfights").delete().eq("match_id", match_id).execute()
+
+    # Delete position data
+    sb.table("player_positions").delete().eq("match_id", match_id).execute()
+
+    # Delete ward events
+    sb.table("ward_events").delete().eq("match_id", match_id).execute()
+
+    # Delete fight scores (Phase 2, but safe to include)
+    sb.table("fight_scores").delete().eq("match_id", match_id).execute()
+
+    # Delete death analysis (Phase 2)
+    sb.table("death_analysis").delete().eq("match_id", match_id).execute()
+
+    # match_players and matches use upsert, so they handle duplicates already
+
+    logger.debug(f"Cleared existing data for match {match_id}")
+
+
 def upsert_match(match_data: dict) -> dict:
     """Insert or update a match record."""
     sb = get_supabase()

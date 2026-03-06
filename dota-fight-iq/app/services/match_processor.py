@@ -58,6 +58,9 @@ class MatchProcessor:
         if stratz_data:
             self.storage.store_raw_match(match_id, stratz_data, source="stratz")
 
+        # Step 3.5: Clean up any existing data for this match (safe reprocessing)
+        db.delete_match_data(match_id)
+
         # Step 4: Extract and store match record
         match_record = self._extract_match(od_data, storage_key_od)
         db.upsert_match(match_record)
