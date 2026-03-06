@@ -281,3 +281,19 @@ def update_analysis_status(match_id: int, status: str) -> dict:
         .eq("match_id", match_id)
         .execute()
     )
+    
+# =====================================================
+# ADD THIS TO app/core/database.py
+# (paste at the end, before the file ends)
+# =====================================================
+
+def get_match_players(match_id: int) -> list[dict]:
+    """Get all player records for a match."""
+    sb = get_supabase()
+    result = (
+        sb.table("match_players")
+        .select("*")
+        .eq("match_id", match_id)
+        .execute()
+    )
+    return result.data or []

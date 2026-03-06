@@ -2,6 +2,8 @@
 Dota Fight IQ — FastAPI Application
 
 Main API server. Handles match analysis requests and serves processed data.
+Phase 2: ML scoring integrated — Fight IQ scores, outcome predictions,
+         benchmarks, recommendations, fight archetypes.
 """
 
 import logging
@@ -17,7 +19,7 @@ from app.services.match_processor import MatchProcessor
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Shared processor instance
+# Shared instances
 processor: MatchProcessor | None = None
 
 
@@ -26,6 +28,12 @@ async def lifespan(app: FastAPI):
     """Startup / shutdown lifecycle."""
     global processor
     processor = MatchProcessor()
+
+    # Load ML models into memory
+    from app.ml.scoring import get_scorer
+    scorer = get_scorer()
+    logger.info(f"ML models loaded: {scorer.get_model_info()}")
+
     logger.info("Dota Fight IQ API started")
     yield
     if processor:
@@ -36,7 +44,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Dota Fight IQ",
     description="ML-Powered Teamfight Performance Analyzer",
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
@@ -53,7 +61,13 @@ app.add_middleware(
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "dota-fight-iq"}
+    from app.ml.scoring import get_scorer
+    scorer = get_scorer()
+    return {
+        "status": "ok",
+        "service": "dota-fight-iq",
+        "models": scorer.get_model_info(),
+    }
 
 
 from app.core.database import safe_db_call
@@ -169,10 +183,11 @@ async def get_fights(match_id: int):
 @app.get("/api/fights/{match_id}/{fight_index}")
 async def get_fight_detail(match_id: int, fight_index: int):
     """
-    Fight deep-dive: player stats, benchmarks, recommendations.
-    Phase 1: returns raw fight data.
-    Phase 2: adds benchmark comparisons and recommendations.
+    Fight deep-dive: player stats, benchmarks, recommendations, scores.
+    Phase 2: full ML-powered analysis.
     """
+    from app.ml.scoring import get_scorer
+
     sb = db.get_supabase()
     fight = (
         sb.table("teamfights")
@@ -185,10 +200,39 @@ async def get_fight_detail(match_id: int, fight_index: int):
     if not fight:
         raise HTTPException(404, f"Fight {fight_index} not found in match {match_id}")
 
+    fight_data = fight[0]
+    scorer = get_scorer()
+
+    # Get match + player data for scoring context
+    match = db.get_match(match_id)
+    players = db.get_match_players(match_id)
+
+    # Score each player in the fight
+    scored_players = []
+    for stat in fight_data.get("fight_player_stats", []):
+        if scorer.is_loaded and scorer.fight_iq:
+            try:
+                analysis = scorer.score_player_fight(stat, fight_data, match, players)
+                scored_players.append({**stat, "analysis": analysis})
+            except Exception as e:
+                logger.warning(f"Scoring failed for player {stat.get('hero_id')}: {e}")
+                scored_players.append(stat)
+        else:
+            scored_players.append(stat)
+
+    # Fight outcome prediction
+    outcome = None
+    if scorer.is_loaded and scorer.fight_outcome:
+        outcome = scorer.predict_fight_outcome(
+            fight_data, fight_data.get("fight_player_stats", []), match, players
+        )
+
     return {
         "match_id": match_id,
         "fight_index": fight_index,
-        "fight": fight[0],
+        "fight": fight_data,
+        "player_scores": scored_players,
+        "outcome_prediction": outcome,
     }
 
 
@@ -234,6 +278,63 @@ async def get_fight_minimap(match_id: int, fight_index: int):
     }
 
 
+# ── Similar Fights (pgvector) ─────────────────────────────
+
+@app.get("/api/fights/{match_id}/{fight_index}/similar")
+async def get_similar_fights(
+    match_id: int,
+    fight_index: int,
+    hero_id: int | None = None,
+    limit: int = 5,
+):
+    """
+    Find similar 7k+ fights using pgvector cosine similarity.
+    Optionally filter by hero_id for same-hero comparisons.
+    """
+    sb = db.get_supabase()
+
+    # Get the source fight's vector
+    fight = (
+        sb.table("teamfights")
+        .select("id")
+        .eq("match_id", match_id)
+        .eq("fight_index", fight_index)
+        .execute()
+    ).data
+    if not fight:
+        raise HTTPException(404, f"Fight {fight_index} not found")
+
+    teamfight_id = fight[0]["id"]
+
+    # Get the vector for this fight + hero
+    query = sb.table("fight_vectors").select("embedding").eq("teamfight_id", teamfight_id)
+    if hero_id:
+        query = query.eq("hero_id", hero_id)
+    source_vec = query.limit(1).execute().data
+
+    if not source_vec:
+        return {"similar_fights": [], "message": "No vector found for this fight. Run training pipeline first."}
+
+    embedding = source_vec[0]["embedding"]
+
+    # Use Supabase RPC for pgvector similarity search
+    # This requires a SQL function — see migration below
+    try:
+        result = sb.rpc("find_similar_fights", {
+            "query_embedding": embedding,
+            "match_hero_id": hero_id,
+            "exclude_match_id": match_id,
+            "result_limit": limit,
+        }).execute()
+        return {"similar_fights": result.data or []}
+    except Exception as e:
+        logger.warning(f"Similar fight search failed: {e}")
+        return {
+            "similar_fights": [],
+            "message": "pgvector search not available. Run the similarity search migration.",
+        }
+
+
 # ── Hero Benchmarks (public) ──────────────────────────────
 
 @app.get("/api/heroes/{hero_id}/benchmarks")
@@ -247,6 +348,23 @@ async def hero_benchmarks(hero_id: int):
         .execute()
     ).data
     return {"hero_id": hero_id, "benchmarks": benchmarks}
+
+
+# ── ML Model Management ──────────────────────────────────
+
+@app.get("/api/models/info")
+async def model_info():
+    """Check loaded model versions and metrics."""
+    from app.ml.scoring import get_scorer
+    return get_scorer().get_model_info()
+
+
+@app.post("/api/models/reload")
+async def reload_models():
+    """Reload models after retraining."""
+    from app.ml.scoring import reload_models as _reload
+    scorer = _reload()
+    return {"status": "reloaded", "models": scorer.get_model_info()}
 
 
 # ── Data Collection Status (admin) ────────────────────────
