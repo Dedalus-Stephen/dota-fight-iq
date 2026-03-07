@@ -9,9 +9,6 @@ import logging
 import httpx
 
 # ── Force HTTP/1.1 globally ───────────────────────────────
-# Supabase SDK creates its own httpx clients internally with http2=True.
-# HTTP/2 connections to Supabase drop with ConnectionTerminated errors.
-# Monkey-patch httpx.Client to always disable HTTP/2.
 _original_httpx_client_init = httpx.Client.__init__
 
 def _patched_httpx_client_init(self, *args, **kwargs):
@@ -50,15 +47,19 @@ def _reset_client():
 
 
 def safe_db_call(fn, *args, **kwargs):
-    """
-    Execute a database operation with automatic retry on connection errors.
-    Resets the Supabase client and retries once if the connection is stale.
-    """
+    """Execute a DB op with automatic retry on connection errors."""
     try:
         return fn(*args, **kwargs)
     except Exception as e:
         error_msg = str(e)
-        if "RemoteProtocolError" in error_msg or "ConnectionTerminated" in error_msg or "ConnectionReset" in error_msg:
+        if any(
+            k in error_msg
+            for k in (
+                "RemoteProtocolError",
+                "ConnectionTerminated",
+                "ConnectionReset",
+            )
+        ):
             _reset_client()
             try:
                 return fn(*args, **kwargs)
@@ -73,29 +74,33 @@ def safe_db_call(fn, *args, **kwargs):
 def delete_match_data(match_id: int):
     """
     Delete all existing data for a match before reprocessing.
-    Order matters: delete children before parents (foreign key constraints).
+    Order: children before parents (foreign key constraints).
     """
     sb = get_supabase()
 
-    # Delete fight_player_stats (references teamfights)
+    # v2 tables (no FK to teamfights, safe to delete in any order)
+    for table in (
+        "chat_analysis",
+        "match_player_scores",
+        "farming_analysis",
+        "itemization_analysis",
+        "laning_analysis",
+        "match_objectives",
+        "fight_context",
+    ):
+        try:
+            sb.table(table).delete().eq("match_id", match_id).execute()
+        except Exception as e:
+            # Table may not exist yet if migration hasn't run
+            logger.debug(f"Skipping cleanup for {table}: {e}")
+
+    # v1 tables
     sb.table("fight_player_stats").delete().eq("match_id", match_id).execute()
-
-    # Delete teamfights
     sb.table("teamfights").delete().eq("match_id", match_id).execute()
-
-    # Delete position data
     sb.table("player_positions").delete().eq("match_id", match_id).execute()
-
-    # Delete ward events
     sb.table("ward_events").delete().eq("match_id", match_id).execute()
-
-    # Delete fight scores (Phase 2, but safe to include)
     sb.table("fight_scores").delete().eq("match_id", match_id).execute()
-
-    # Delete death analysis (Phase 2)
     sb.table("death_analysis").delete().eq("match_id", match_id).execute()
-
-    # match_players and matches use upsert, so they handle duplicates already
 
     logger.debug(f"Cleared existing data for match {match_id}")
 
@@ -127,6 +132,18 @@ def upsert_match_players(players: list[dict]) -> dict:
     )
 
 
+def get_match_players(match_id: int) -> list[dict]:
+    """Get all player records for a match."""
+    sb = get_supabase()
+    result = (
+        sb.table("match_players")
+        .select("*")
+        .eq("match_id", match_id)
+        .execute()
+    )
+    return result.data or []
+
+
 # ── Teamfight Operations ──────────────────────────────────
 
 def insert_teamfights(teamfights: list[dict]) -> dict:
@@ -142,7 +159,7 @@ def insert_fight_player_stats(stats: list[dict]) -> dict:
 
 
 def get_teamfights_for_match(match_id: int) -> list[dict]:
-    """Get all teamfights for a match."""
+    """Get all teamfights for a match with player stats."""
     sb = get_supabase()
     result = (
         sb.table("teamfights")
@@ -154,7 +171,144 @@ def get_teamfights_for_match(match_id: int) -> list[dict]:
     return result.data
 
 
-# ── Benchmark Operations ───────────────────────────────────
+# ── Fight Context Operations ──────────────────────────────
+
+def get_fight_context(teamfight_id: int) -> dict | None:
+    """Get team state snapshot for a specific fight."""
+    sb = get_supabase()
+    result = (
+        sb.table("fight_context")
+        .select("*")
+        .eq("teamfight_id", teamfight_id)
+        .execute()
+    )
+    return result.data[0] if result.data else None
+
+
+def get_fight_contexts_for_match(match_id: int) -> list[dict]:
+    """Get all fight contexts for a match."""
+    sb = get_supabase()
+    result = (
+        sb.table("fight_context")
+        .select("*")
+        .eq("match_id", match_id)
+        .execute()
+    )
+    return result.data or []
+
+
+# ── Objectives Operations ─────────────────────────────────
+
+def get_objectives_for_match(match_id: int) -> list[dict]:
+    """Get all objectives for a match."""
+    sb = get_supabase()
+    result = (
+        sb.table("match_objectives")
+        .select("*")
+        .eq("match_id", match_id)
+        .order("time")
+        .execute()
+    )
+    return result.data or []
+
+
+# ── Laning Operations ─────────────────────────────────────
+
+def get_laning_for_match(match_id: int) -> list[dict]:
+    """Get laning analysis for all players in a match."""
+    sb = get_supabase()
+    result = (
+        sb.table("laning_analysis")
+        .select("*")
+        .eq("match_id", match_id)
+        .execute()
+    )
+    return result.data or []
+
+
+# ── Itemization Operations ────────────────────────────────
+
+def get_itemization_for_match(match_id: int) -> list[dict]:
+    """Get itemization data for all players in a match."""
+    sb = get_supabase()
+    result = (
+        sb.table("itemization_analysis")
+        .select("*")
+        .eq("match_id", match_id)
+        .execute()
+    )
+    return result.data or []
+
+
+# ── Farming Operations ────────────────────────────────────
+
+def get_farming_for_match(match_id: int) -> list[dict]:
+    """Get farming analysis for all players in a match."""
+    sb = get_supabase()
+    result = (
+        sb.table("farming_analysis")
+        .select("*")
+        .eq("match_id", match_id)
+        .execute()
+    )
+    return result.data or []
+
+
+# ── Chat / Toxicity Operations ────────────────────────────
+
+def get_chat_for_match(match_id: int) -> list[dict]:
+    """Get chat analysis for all players in a match."""
+    sb = get_supabase()
+    result = (
+        sb.table("chat_analysis")
+        .select("*")
+        .eq("match_id", match_id)
+        .execute()
+    )
+    return result.data or []
+
+
+# ── Match Player Scores Operations ────────────────────────
+
+def get_match_scores(match_id: int) -> list[dict]:
+    """Get overall player scores/rankings for a match."""
+    sb = get_supabase()
+    result = (
+        sb.table("match_player_scores")
+        .select("*")
+        .eq("match_id", match_id)
+        .order("match_rank")
+        .execute()
+    )
+    return result.data or []
+
+
+def upsert_match_scores(scores: list[dict]) -> dict:
+    """Insert or update match player scores."""
+    sb = get_supabase()
+    return (
+        sb.table("match_player_scores")
+        .upsert(scores, on_conflict="match_id,player_slot")
+        .execute()
+    )
+
+
+# ── Ward Operations ───────────────────────────────────────
+
+def get_wards_for_match(match_id: int) -> list[dict]:
+    """Get all ward events for a match."""
+    sb = get_supabase()
+    result = (
+        sb.table("ward_events")
+        .select("*")
+        .eq("match_id", match_id)
+        .order("time")
+        .execute()
+    )
+    return result.data or []
+
+
+# ── Benchmark Operations ──────────────────────────────────
 
 def get_hero_benchmark(
     hero_id: int,
@@ -181,12 +335,38 @@ def upsert_benchmarks(benchmarks: list[dict]) -> dict:
     sb = get_supabase()
     return (
         sb.table("hero_benchmarks")
-        .upsert(benchmarks, on_conflict="hero_id,time_bucket,nw_bucket,duration_bucket,size_bucket,metric_name")
+        .upsert(
+            benchmarks,
+            on_conflict="hero_id,time_bucket,nw_bucket,duration_bucket,size_bucket,metric_name",
+        )
         .execute()
     )
 
 
-# ── High MMR Match Pool ───────────────────────────────────
+def get_item_timing_benchmarks(hero_id: int) -> list[dict]:
+    """Get item timing benchmarks for a hero."""
+    sb = get_supabase()
+    result = (
+        sb.table("item_timing_benchmarks")
+        .select("*")
+        .eq("hero_id", hero_id)
+        .execute()
+    )
+    return result.data or []
+
+
+def get_objective_benchmarks() -> list[dict]:
+    """Get all objective timing benchmarks."""
+    sb = get_supabase()
+    result = (
+        sb.table("objective_benchmarks")
+        .select("*")
+        .execute()
+    )
+    return result.data or []
+
+
+# ── High MMR Match Pool ──────────────────────────────────
 
 def insert_match_pool(match_ids: list[dict]) -> dict:
     """Insert discovered high-MMR match IDs for processing."""
@@ -212,7 +392,7 @@ def get_unprocessed_matches(limit: int = 50) -> list[dict]:
 
 
 def update_match_pool_status(match_id: int, status: str) -> dict:
-    """Update collection status: pending → fetching → parsed → processed → failed."""
+    """Update collection status."""
     sb = get_supabase()
     return (
         sb.table("match_collection_pool")
@@ -222,19 +402,18 @@ def update_match_pool_status(match_id: int, status: str) -> dict:
     )
 
 
-# ── Position Data ──────────────────────────────────────────
+# ── Position Data ─────────────────────────────────────────
 
 def insert_player_positions(positions: list[dict]) -> dict:
     """Bulk insert position data from STRATZ playback."""
     sb = get_supabase()
-    # Batch insert in chunks of 1000
     for i in range(0, len(positions), 1000):
         chunk = positions[i : i + 1000]
         sb.table("player_positions").insert(chunk).execute()
     return {"inserted": len(positions)}
 
 
-# ── User / Analysis ───────────────────────────────────────
+# ── User / Analysis ──────────────────────────────────────
 
 def get_or_create_user(steam_id: str, profile: dict) -> dict:
     """Get or create a user from Steam login."""
@@ -273,7 +452,7 @@ def create_analysis(match_id: int, user_id: str) -> dict:
 
 
 def update_analysis_status(match_id: int, status: str) -> dict:
-    """Update analysis status: pending → processing → complete → failed."""
+    """Update analysis status."""
     sb = get_supabase()
     return (
         sb.table("match_analyses")
@@ -281,19 +460,3 @@ def update_analysis_status(match_id: int, status: str) -> dict:
         .eq("match_id", match_id)
         .execute()
     )
-    
-# =====================================================
-# ADD THIS TO app/core/database.py
-# (paste at the end, before the file ends)
-# =====================================================
-
-def get_match_players(match_id: int) -> list[dict]:
-    """Get all player records for a match."""
-    sb = get_supabase()
-    result = (
-        sb.table("match_players")
-        .select("*")
-        .eq("match_id", match_id)
-        .execute()
-    )
-    return result.data or []
