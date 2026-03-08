@@ -16,6 +16,8 @@ from app.core import database as db
 from app.core.database import safe_db_call
 from app.services.match_processor import MatchProcessor
 
+from app.api.fight_actions import router as fight_actions_router
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Dota Fight IQ", version="0.4.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.include_router(fight_actions_router)
 
 
 @app.get("/health")

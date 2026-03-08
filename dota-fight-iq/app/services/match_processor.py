@@ -301,6 +301,7 @@ class MatchProcessor:
                 "stuns": p.get("stuns", 0),
                 "rune_pickups": p.get("rune_pickups", 0),
                 "actions_per_min": p.get("actions_per_min", 0),
+                "kills_log": p.get("kills_log"),
             })
         return players
 
