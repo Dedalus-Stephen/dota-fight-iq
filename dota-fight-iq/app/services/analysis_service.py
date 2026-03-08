@@ -25,6 +25,7 @@ from app.ml.extended_benchmarks import (
     FARMING_METRICS,
     SUPPORT_METRICS,
 )
+from app.api.items_enhanced import enrich_purchase_timeline, get_recommended_build_for_player
 
 logger = logging.getLogger(__name__)
 
@@ -201,10 +202,20 @@ class AnalysisService:
     # ── Itemization Analysis ───────────────────────────────
 
     def analyze_items(self, match_id: int) -> list[dict]:
-        """Enrich itemization data with timing benchmarks."""
+        """Enrich itemization data with timing benchmarks + ML-recommended builds."""
+        from app.core.database import get_supabase
+        from app.api.items_enhanced import enrich_purchase_timeline, get_recommended_build_for_player
+
+        sb = get_supabase()
+
         item_data = db.get_itemization_for_match(match_id)
         if not item_data:
             return []
+
+        # Get all players to determine teams for lineup-aware recommendations
+        all_players = db.get_match_players(match_id)
+        radiant_heroes = sorted([p["hero_id"] for p in all_players if p.get("is_radiant")])
+        dire_heroes = sorted([p["hero_id"] for p in all_players if not p.get("is_radiant")])
 
         results = []
         for player in item_data:
@@ -212,6 +223,12 @@ class AnalysisService:
             if not hero_id:
                 results.append(player)
                 continue
+
+            # Determine this player's team context
+            is_radiant = player.get("is_radiant", True)
+            position = player.get("lane") or player.get("role") or 0
+            enemy_hero_ids = dire_heroes if is_radiant else radiant_heroes
+            ally_hero_ids = [h for h in (radiant_heroes if is_radiant else dire_heroes) if h != hero_id]
 
             item_benchmarks = self._get_item_benchmarks_for_hero(hero_id)
             item_timings = player.get("item_timings") or {}
@@ -221,21 +238,18 @@ class AnalysisService:
             for item_key, player_time in item_timings.items():
                 bench = item_benchmarks.get(item_key)
                 if bench and bench.get("median_time") is not None:
-                    # For items, lower time = better, so we invert the percentile
                     median = bench["median_time"]
                     p25 = bench.get("p25_time", median)
                     p75 = bench.get("p75_time", median)
 
-                    # Faster than p25 = great, slower than p75 = bad
                     if p25 == p75:
                         pct = 50.0
                     else:
-                        # Invert: lower time = higher percentile
                         raw_pct = percentile_from_benchmark(
                             player_time,
                             {"p25": p25, "median": median, "p75": p75, "p90": bench.get("p75_time", p75)},
                         )
-                        pct = 100 - raw_pct  # invert so faster = higher
+                        pct = 100 - raw_pct
 
                     delta_seconds = player_time - median
 
@@ -252,7 +266,6 @@ class AnalysisService:
                         "is_fast": delta_seconds < 0,
                     })
 
-            # Sort by delta (most delayed items first)
             item_comparisons.sort(key=lambda x: x["delta_seconds"], reverse=True)
 
             # Generate item-specific recommendations
@@ -262,7 +275,7 @@ class AnalysisService:
 
             for ic in item_comparisons:
                 item_name = ic["item"].replace("_", " ").title()
-                if ic["delta_seconds"] > 120:  # More than 2 min late
+                if ic["delta_seconds"] > 120:
                     recommendations.append({
                         "metric": ic["item"],
                         "category": "items",
@@ -275,7 +288,7 @@ class AnalysisService:
                         "priority": min(ic["delta_seconds"] / 60, 30),
                         "sample_count": ic["sample_count"],
                     })
-                elif ic["delta_seconds"] < -120:  # More than 2 min early
+                elif ic["delta_seconds"] < -120:
                     recommendations.append({
                         "metric": ic["item"],
                         "category": "items",
@@ -289,7 +302,6 @@ class AnalysisService:
                         "sample_count": ic["sample_count"],
                     })
 
-            # Item score: average percentile across timed items
             if item_comparisons:
                 item_score = round(
                     sum(ic["percentile"] for ic in item_comparisons) / len(item_comparisons), 1
@@ -299,11 +311,24 @@ class AnalysisService:
 
             recommendations.sort(key=lambda r: r["priority"], reverse=True)
 
+            # Enrich purchase timeline with 7k+ median times per item
+            enriched_timeline = enrich_purchase_timeline(
+                sb, player.get("purchase_log", []), hero_id, position
+            )
+
+            # ML-recommended item build based on similar 7k+ matches
+            recommended_build = get_recommended_build_for_player(
+                sb, hero_id, position or 0, enemy_hero_ids, ally_hero_ids
+            )
+
             results.append({
                 **player,
                 "item_benchmarks": item_comparisons,
                 "item_score": item_score,
                 "recommendations": recommendations,
+                "purchase_log": enriched_timeline,
+                "recommended_build": recommended_build,
+                "enemy_hero_ids": enemy_hero_ids,
             })
 
         return results

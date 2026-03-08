@@ -217,13 +217,23 @@ class MatchProcessor:
             logger.warning(
                 f"Chat extraction failed for match {match_id}: {e}"
             )
-
+        
+        build_count = {"item_snapshots": 0, "ability_builds": 0, "context_vectors": 0}
+        try:
+            from app.services.build_extractor import process_match_builds
+            from app.core.database import get_supabase
+            build_count = process_match_builds(get_supabase(), match_id, od_data)
+        except Exception as e:
+            logger.warning(f"Build extraction failed for match {match_id}: {e}")
+            
         logger.info(
             f"Match {match_id} processed: {fight_count} fights, "
             f"{position_count} positions, {ward_count} wards, "
             f"{objective_count} objectives, {laning_count} laning, "
             f"{item_count} items, {farming_count} farming, "
-            f"{chat_count} chat records"
+            f"{chat_count} chat records, "
+            f"{build_count.get('item_snapshots', 0)} item snapshots, "
+            f"{build_count.get('ability_builds', 0)} ability builds"
         )
 
         return {
@@ -237,6 +247,7 @@ class MatchProcessor:
             "items": item_count,
             "farming": farming_count,
             "chat": chat_count,
+            "build_count": build_count
         }
 
     # ═══════════════════════════════════════════════════════
@@ -518,7 +529,7 @@ class MatchProcessor:
         objectives = []
 
         for obj in od_data.get("objectives", []):
-            key = obj.get("key", "")
+            key = str(obj.get("key") or "")
             obj_type = obj.get("type", "")
 
             # Derive subtype from key
