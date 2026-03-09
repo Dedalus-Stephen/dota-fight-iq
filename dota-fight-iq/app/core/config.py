@@ -14,14 +14,17 @@ class Settings(BaseSettings):
     database_url: str
 
     # Storage
-    storage_backend: str = "local"  # "local" or "s3"
+    storage_backend: str = "local"  # "local" or "gcs"
     storage_local_dir: str = "./data"  # Used when storage_backend = "local"
 
-    # AWS (only required when storage_backend = "s3" or deploying to AWS)
-    aws_access_key_id: str = ""
-    aws_secret_access_key: str = ""
-    aws_region: str = "eu-west-1"
-    s3_bucket: str = "dota-fight-iq-data"
+    # GCP (only required when storage_backend = "gcs" or deploying to Cloud Run)
+    gcp_project_id: str = ""
+    gcs_bucket: str = "dota-fight-iq-data"
+    # Authentication: uses Application Default Credentials (ADC).
+    # - Local dev: run `gcloud auth application-default login`
+    # - Cloud Run: automatic via attached service account
+    # - CI/CD: set GOOGLE_APPLICATION_CREDENTIALS env var pointing to a key file
+    gcp_credentials_path: str = ""  # Optional: explicit path to service account JSON
 
     # External APIs
     opendota_api_key: str = ""  # Optional, increases rate limit

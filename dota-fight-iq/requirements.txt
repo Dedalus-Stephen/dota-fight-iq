@@ -9,17 +9,14 @@ supabase==2.28.0
 asyncpg==0.31.0
 sqlalchemy==2.0.36
 
-# AWS (only needed when STORAGE_BACKEND=s3)
-# boto3==1.36.7   # uncomment if needed; latest is 1.38.1, but not critical
+# GCP (only needed when STORAGE_BACKEND=gcs)
+google-cloud-storage==2.19.0
 
 # HTTP client
 httpx==0.28.1
 aiohttp==3.11.11
 
-# Task queue
-celery[sqs]==5.6.2
-
-# ML (Phase 2, but install now)
+# ML
 scikit-learn==1.8.0
 xgboost==3.2.0
 numpy==2.4.2

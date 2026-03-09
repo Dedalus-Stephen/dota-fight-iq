@@ -4,10 +4,11 @@ Storage Abstraction Layer
 Provides a unified interface for storing raw match JSONs and model artifacts.
 Backend is selected by STORAGE_BACKEND env var:
   - "local" (default): stores files on local disk
-  - "s3": stores files in AWS S3
+  - "gcs": stores files in Google Cloud Storage
 
-Switching from local to S3 requires only changing STORAGE_BACKEND and
-adding AWS credentials in .env. No code changes anywhere else.
+Switching from local to GCS requires only changing STORAGE_BACKEND and
+configuring GCP credentials (ADC or service account). No code changes
+anywhere else in the application.
 """
 
 import os
@@ -106,66 +107,79 @@ class LocalStorageBackend(StorageBackend):
         ]
 
 
-# ── S3 Backend ─────────────────────────────────────────────
+# ── Google Cloud Storage Backend ──────────────────────────
 
-class S3StorageBackend(StorageBackend):
-    """Stores files in AWS S3. For production deployment."""
+class GCSStorageBackend(StorageBackend):
+    """Stores files in Google Cloud Storage. For production deployment.
+
+    Authentication uses Application Default Credentials (ADC):
+    - Local dev: `gcloud auth application-default login`
+    - Cloud Run: automatic via attached service account
+    - CI/CD: set GOOGLE_APPLICATION_CREDENTIALS to service account JSON path
+    """
 
     def __init__(self):
-        import boto3
+        from google.cloud import storage as gcs_storage
+
         settings = get_settings()
-        self.s3 = boto3.client(
-            "s3",
-            aws_access_key_id=settings.aws_access_key_id,
-            aws_secret_access_key=settings.aws_secret_access_key,
-            region_name=settings.aws_region,
-        )
-        self.bucket = settings.s3_bucket
+
+        # If an explicit credentials path is set, use it.
+        # Otherwise, rely on ADC (which Cloud Run provides automatically).
+        if settings.gcp_credentials_path:
+            self.client = gcs_storage.Client.from_service_account_json(
+                settings.gcp_credentials_path,
+                project=settings.gcp_project_id or None,
+            )
+        else:
+            self.client = gcs_storage.Client(
+                project=settings.gcp_project_id or None,
+            )
+
+        self.bucket_name = settings.gcs_bucket
+        self.bucket = self.client.bucket(self.bucket_name)
+        logger.info(f"GCS storage initialized: gs://{self.bucket_name}")
 
     def store_raw_match(self, match_id: int, data: dict, source: str = "opendota") -> str:
         key = f"raw/{source}/{match_id}.json"
-        self.s3.put_object(
-            Bucket=self.bucket,
-            Key=key,
-            Body=orjson.dumps(data),
-            ContentType="application/json",
+        blob = self.bucket.blob(key)
+        blob.upload_from_string(
+            orjson.dumps(data),
+            content_type="application/json",
         )
+        logger.debug(f"Stored raw match {match_id} at gs://{self.bucket_name}/{key}")
         return key
 
     def get_raw_match(self, match_id: int, source: str = "opendota") -> dict | None:
         key = f"raw/{source}/{match_id}.json"
-        try:
-            response = self.s3.get_object(Bucket=self.bucket, Key=key)
-            return orjson.loads(response["Body"].read())
-        except self.s3.exceptions.NoSuchKey:
+        blob = self.bucket.blob(key)
+        if not blob.exists():
             return None
+        return orjson.loads(blob.download_as_bytes())
 
     def store_model(self, model_name: str, version: str, model_bytes: bytes) -> str:
         key = f"models/{model_name}/{version}.pkl"
-        self.s3.put_object(
-            Bucket=self.bucket,
-            Key=key,
-            Body=model_bytes,
-            ContentType="application/octet-stream",
+        blob = self.bucket.blob(key)
+        blob.upload_from_string(
+            model_bytes,
+            content_type="application/octet-stream",
         )
+        logger.debug(f"Stored model {model_name}/{version} at gs://{self.bucket_name}/{key}")
         return key
 
     def get_model(self, model_name: str, version: str) -> bytes | None:
         key = f"models/{model_name}/{version}.pkl"
-        try:
-            response = self.s3.get_object(Bucket=self.bucket, Key=key)
-            return response["Body"].read()
-        except self.s3.exceptions.NoSuchKey:
+        blob = self.bucket.blob(key)
+        if not blob.exists():
             return None
+        return blob.download_as_bytes()
 
     def list_model_versions(self, model_name: str) -> list[str]:
         prefix = f"models/{model_name}/"
-        response = self.s3.list_objects_v2(Bucket=self.bucket, Prefix=prefix)
-        if "Contents" not in response:
-            return []
+        blobs = self.client.list_blobs(self.bucket_name, prefix=prefix)
         return [
-            obj["Key"].split("/")[-1].replace(".pkl", "")
-            for obj in response["Contents"]
+            blob.name.split("/")[-1].replace(".pkl", "")
+            for blob in blobs
+            if blob.name.endswith(".pkl")
         ]
 
 
@@ -177,14 +191,15 @@ _instance: StorageBackend | None = None
 def get_storage() -> StorageBackend:
     """
     Returns the configured storage backend (singleton).
-    Set STORAGE_BACKEND=s3 in .env to use S3, otherwise uses local disk.
+    Set STORAGE_BACKEND=gcs in .env to use Google Cloud Storage,
+    otherwise uses local disk.
     """
     global _instance
     if _instance is None:
         settings = get_settings()
-        if settings.storage_backend == "s3":
-            logger.info("Using S3 storage backend")
-            _instance = S3StorageBackend()
+        if settings.storage_backend == "gcs":
+            logger.info("Using GCS storage backend")
+            _instance = GCSStorageBackend()
         else:
             logger.info(f"Using local storage backend at {settings.storage_local_dir}")
             _instance = LocalStorageBackend(settings.storage_local_dir)
