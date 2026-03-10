@@ -460,3 +460,18 @@ def update_analysis_status(match_id: int, status: str) -> dict:
         .eq("match_id", match_id)
         .execute()
     )
+
+def get_latest_parse_job(match_id: int) -> dict | None:
+    """Get the most recent parse job for a match."""
+    sb = get_supabase()
+    result = (
+        sb.table("parse_jobs")
+        .select("*")
+        .eq("match_id", match_id)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if result.data:
+        return result.data[0]
+    return None

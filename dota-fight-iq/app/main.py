@@ -309,3 +309,27 @@ async def collection_status():
         "teamfights_stored": sb.table("teamfights").select("id", count="exact").execute().count,
         "pool_pending": sb.table("match_collection_pool").select("match_id", count="exact").eq("status", "pending").execute().count,
     }
+
+@app.get("/api/analyze/{match_id}/status")
+async def get_analysis_status(match_id: int):
+    # Already fully processed?
+    existing = safe_db_call(db.get_match, match_id)
+    if existing and existing.get("processed_at"):
+        return {"status": "complete", "match_id": match_id}
+
+    # Is there a local parse job in flight?
+    job = safe_db_call(db.get_latest_parse_job, match_id)
+    if job:
+        return {
+            "status": job["status"],   # queued | parsing | complete | failed
+            "job_id": job["job_id"],
+            "error": job.get("error"),
+            "match_id": match_id,
+        }
+
+    # Check if it's sitting in the processing queue (OpenDota path)
+    analysis = safe_db_call(db.get_analysis_status, match_id)
+    if analysis:
+        return {"status": analysis, "match_id": match_id}
+
+    return {"status": "not_started", "match_id": match_id}    

@@ -68,9 +68,8 @@ class MatchProcessor:
 
         # Check if parsed
         if not self.opendota.is_parsed(od_data):
-            logger.info(f"Match {match_id} not parsed. Requesting parse.")
-            await self.opendota.request_parse(match_id)
-            return {"status": "parse_requested", "match_id": match_id}
+            logger.info(f"Match {match_id} not parsed on OpenDota. Attempting local parse.")
+            return await self.request_local_parse(match_id)
 
         # Step 2: Fetch from STRATZ (position data — optional)
         stratz_data = None
@@ -955,6 +954,17 @@ class MatchProcessor:
                 })
 
         return positions
+    
+    # ── Parser Worker ────────────────────────────────────────────────
+    async def request_local_parse(self, match_id: int) -> dict:
+        replay_url = await self.opendota.get_replay_url(match_id)
+        if not replay_url:
+            raise ValueError(f"Cannot resolve replay URL for match {match_id}. "
+                            "Match may be too old (>7 days) or from a private lobby.")
+
+        from app.services.parse_dispatcher import enqueue_parse_job
+        job_id = await enqueue_parse_job(match_id, replay_url)
+        return {"status": "parse_queued", "job_id": job_id}
 
     async def close(self):
         await self.opendota.close()

@@ -182,6 +182,17 @@ class OpenDotaClient:
     async def get_heroes(self) -> list[dict]:
         """Get list of all heroes with stats."""
         return await self._get("/heroes") or []
+    
+    # ── Parser Worker ────────────────────────────────────────────────
+    async def get_replay_url(self, match_id: int) -> str | None:
+        data = await self._get(f"/matches/{match_id}")
+        if not data:
+            return None
+        cluster = data.get("cluster")
+        salt = data.get("replay_salt")
+        if not cluster or not salt:
+            return None
+        return f"http://replay{cluster}.valve.net/570/{match_id}_{salt}.dem.bz2"
 
     # ── Cleanup ────────────────────────────────────────────────
 

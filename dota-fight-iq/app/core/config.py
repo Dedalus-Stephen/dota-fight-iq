@@ -1,4 +1,4 @@
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from functools import lru_cache
 
 
@@ -33,6 +33,15 @@ class Settings(BaseSettings):
     # Rate limits
     opendota_rate_limit: int = 60  # calls per minute
     stratz_rate_limit: int = 10000  # calls per day
+    
+    parser_worker_url: str
+    cloud_run_sa_email: str
+    gcp_region: str = "us-central1"
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        extra="ignore"  # <--- Adding this will also prevent future crashes from extra vars
+    )
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
