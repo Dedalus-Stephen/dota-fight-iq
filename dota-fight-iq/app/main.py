@@ -67,17 +67,24 @@ async def analyze_match(match_id: int, background_tasks: BackgroundTasks):
 async def _process_match_background(match_id: int):
     from app.core.database import _reset_client
     try:
+        safe_db_call(db.create_analysis, match_id, None)
+        safe_db_call(db.update_analysis_status, match_id, "processing")
+        
         result = await processor.process_match(match_id)
         logger.info(f"Match {match_id}: {result}")
+        safe_db_call(db.update_analysis_status, match_id, "complete")
     except Exception as e:
         if "RemoteProtocolError" in str(e) or "ConnectionTerminated" in str(e):
             _reset_client()
             try:
-                await processor.process_match(match_id)
+                result = await processor.process_match(match_id)
+                safe_db_call(db.update_analysis_status, match_id, "complete")
             except Exception as e2:
                 logger.error(f"Match {match_id} retry failed: {e2}")
+                safe_db_call(db.update_analysis_status, match_id, "failed")
         else:
             logger.error(f"Match {match_id} failed: {e}")
+            safe_db_call(db.update_analysis_status, match_id, "failed")
 
 
 @app.get("/api/analyze/{match_id}/status")
@@ -153,7 +160,7 @@ async def get_fight_detail(match_id: int, fight_index: int):
 
     scored_players = []
     for stat in fight_data.get("fight_player_stats", []):
-        if scorer.is_loaded and scorer.fight_iq:
+        if scorer.is_loaded:
             try:
                 analysis = scorer.score_player_fight(stat, fight_data, match, players)
                 scored_players.append({**stat, "analysis": analysis})
