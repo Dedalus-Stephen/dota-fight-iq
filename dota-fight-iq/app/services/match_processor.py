@@ -16,6 +16,9 @@ from app.core.storage import get_storage
 from app.core import database as db
 import os
 import asyncio
+import subprocess
+import json as _json
+from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -996,38 +999,60 @@ class MatchProcessor:
         return {"status": "parse_queued", "job_id": job_id}
     
     async def _parse_via_blob(self, match_id: int, od_data: dict) -> dict | None:
-        """Call odota/parser /blob endpoint to parse the replay synchronously."""
+        """
+        Call odota/parser /blob endpoint to parse the replay synchronously.
+        
+        Replay URL resolution order:
+        1. Check od_data for cluster/salt (already fetched, instant)
+        2. Query Valve GC directly via subprocess (~2 seconds)
+        3. Fall back to OpenDota /request + polling (10-30+ seconds)
+        """
         import httpx as _httpx
-        import asyncio
-
-        # Request parse from OpenDota — this triggers GC data fetch (cluster/salt)
-        try:
-            await self.opendota.request_parse(match_id)
-        except Exception as e:
-            logger.warning(f"Request parse failed for {match_id}: {e}")
-
-        # Poll for cluster/salt to become available (GC data can take a few seconds)
+ 
         replay_url = None
-        for attempt in range(10):
-            await asyncio.sleep(3)
-            od_refreshed = await self.opendota.get_match(match_id)
-            if od_refreshed:
-                cluster = od_refreshed.get("cluster")
-                salt = od_refreshed.get("replay_salt")
-                if cluster and salt:
-                    replay_url = f"http://replay{cluster}.valve.net/570/{match_id}_{salt}.dem.bz2"
-                    logger.info(f"Replay URL resolved on attempt {attempt + 1}: {replay_url}")
-                    break
-            logger.info(f"Waiting for replay salt (attempt {attempt + 1}/10)...")
-
+ 
+        # --- Strategy 1: cluster/salt already in OpenDota basic data ---
+        replay_url = self._build_replay_url(od_data)
+        if replay_url:
+            logger.info(f"Replay URL from OpenDota basic data: {replay_url}")
+ 
+        # --- Strategy 2: Query Valve GC directly (fast, ~2s) ---
         if not replay_url:
-            logger.warning(f"Cannot resolve replay URL for match {match_id} after 10 attempts")
+            logger.info(f"No salt in OpenDota data. Trying Valve GC for match {match_id}...")
+            gc_url = await self._get_replay_url_from_gc(match_id)
+            if gc_url:
+                replay_url = gc_url
+                logger.info(f"Replay URL from GC: {replay_url}")
+ 
+        # --- Strategy 3: OpenDota /request + poll (slow fallback) ---
+        if not replay_url:
+            logger.info(f"GC failed. Falling back to OpenDota /request for match {match_id}...")
+            try:
+                await self.opendota.request_parse(match_id)
+            except Exception as e:
+                logger.warning(f"OpenDota /request failed for {match_id}: {e}")
+ 
+            for attempt in range(20):
+                await asyncio.sleep(5)
+                od_refreshed = await self.opendota.get_match(match_id)
+                if od_refreshed:
+                    cluster = od_refreshed.get("cluster")
+                    salt = od_refreshed.get("replay_salt")
+                    if cluster and salt:
+                        replay_url = f"http://replay{cluster}.valve.net/570/{match_id}_{salt}.dem.bz2"
+                        logger.info(f"Replay URL resolved via OpenDota on attempt {attempt + 1}")
+                        break
+                logger.info(f"Waiting for replay salt ({attempt + 1}/20)...")
+ 
+        if not replay_url:
+            logger.warning(f"Cannot resolve replay URL for match {match_id} after all strategies")
             return None
-
+ 
+        # --- Call parser /blob ---
         parser_url = os.environ.get("PARSER_URL", "http://localhost:5600")
         blob_url = f"{parser_url}/blob?replay_url={replay_url}"
         logger.info(f"Calling parser /blob for match {match_id}")
-
+ 
         try:
             async with _httpx.AsyncClient(timeout=300) as client:
                 resp = await client.get(blob_url)
@@ -1040,6 +1065,61 @@ class MatchProcessor:
                 return None
         except Exception as e:
             logger.error(f"Parser /blob failed for {match_id}: {e}")
+            return None
+ 
+    async def _get_replay_url_from_gc(self, match_id: int) -> str | None:
+        """
+        Query Valve's Game Coordinator for replay URL via subprocess.
+        
+        Uses scripts/gc_get_salt.py which runs gevent (incompatible with asyncio).
+        Returns replay URL string or None on failure.
+        Takes ~2 seconds on success.
+        """
+        import subprocess
+        import json as _json
+ 
+        # Resolve script path relative to project root
+        script_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            "scripts", "gc_get_salt.py"
+        )
+ 
+        if not os.path.exists(script_path):
+            logger.warning(f"GC retriever script not found at {script_path}")
+            return None
+ 
+        try:
+            # Run in thread pool to avoid blocking the event loop
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    ["python3", script_path, str(match_id)],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    env={
+                        **os.environ,
+                        "STEAM_USER": get_settings().steam_user,
+                        "STEAM_PASS": get_settings().steam_pass,
+                    }
+                )
+            )
+ 
+            if result.returncode == 0:
+                data = _json.loads(result.stdout.strip())
+                return data.get("replay_url")
+            else:
+                stderr = result.stderr.strip() if result.stderr else ""
+                stdout = result.stdout.strip() if result.stdout else ""
+                logger.warning(f"GC retriever failed (exit {result.returncode}): {stdout} {stderr}")
+                return None
+ 
+        except subprocess.TimeoutExpired:
+            logger.warning(f"GC retriever timed out for match {match_id}")
+            return None
+        except Exception as e:
+            logger.warning(f"GC retriever error for match {match_id}: {e}")
             return None
         
     def _build_replay_url(self, od_data: dict) -> str | None:

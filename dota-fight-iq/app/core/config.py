@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     parser_worker_url: str
     cloud_run_sa_email: str
     gcp_region: str = "us-central1"
+    
+    # Steam GC Retriever
+    steam_user: str = ""
+    steam_pass: str = ""
 
     # --- MERGED CONFIG ---
     model_config = SettingsConfigDict(
