@@ -14,6 +14,8 @@ from app.clients.opendota import OpenDotaClient
 from app.clients.stratz import StratzClient
 from app.core.storage import get_storage
 from app.core import database as db
+import os
+import asyncio
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +71,34 @@ class MatchProcessor:
         # Check if parsed
         if not self.opendota.is_parsed(od_data):
             logger.info(f"Match {match_id} not parsed on OpenDota. Attempting local parse.")
-            return await self.request_local_parse(match_id)
+            parsed_data = await self._parse_via_blob(match_id, od_data)
+            if parsed_data:
+                # Merge parsed fields into the OpenDota basic data
+                od_data["teamfights"] = parsed_data.get("teamfights", [])
+                od_data["objectives"] = parsed_data.get("objectives", [])
+                od_data["chat"] = parsed_data.get("chat", [])
+                od_data["radiant_gold_adv"] = parsed_data.get("radiant_gold_adv", [])
+                od_data["radiant_xp_adv"] = parsed_data.get("radiant_xp_adv", [])
+                od_data["draft_timings"] = parsed_data.get("draft_timings", [])
+                # Merge per-player parsed fields
+                parsed_players = {p.get("player_slot"): p for p in parsed_data.get("players", [])}
+                for p in od_data.get("players", []):
+                    slot = p.get("player_slot")
+                    pp = parsed_players.get(slot, {})
+                    for field in ("kill_log", "kills_log", "purchase_log", "item_uses",
+                                "ability_uses", "damage", "damage_inflictor", "healing",
+                                "gold_t", "xp_t", "lh_t", "dn_t", "obs_log", "sen_log",
+                                "buyback_log", "runes_log", "lane_pos", "actions",
+                                "killed", "killed_by", "damage_targets", "hero_hits",
+                                "damage_taken", "damage_inflictor_received", "life_state",
+                                "multi_kills", "kill_streaks", "gold_reasons", "xp_reasons",
+                                "purchase", "runes", "obs", "sen", "pings",
+                                "ability_targets", "neutral_item_history"):
+                        if field in pp:
+                            p[field] = pp[field]
+                logger.info(f"Merged local parse data: {len(parsed_data.get('teamfights', []))} teamfights")
+            else:
+                logger.warning(f"Local parse failed for {match_id}, processing without parsed data")
 
         # Step 2: Fetch from STRATZ (position data — optional)
         stratz_data = None
@@ -965,6 +994,61 @@ class MatchProcessor:
         from app.services.parse_dispatcher import enqueue_parse_job
         job_id = await enqueue_parse_job(match_id, replay_url)
         return {"status": "parse_queued", "job_id": job_id}
+    
+    async def _parse_via_blob(self, match_id: int, od_data: dict) -> dict | None:
+        """Call odota/parser /blob endpoint to parse the replay synchronously."""
+        import httpx as _httpx
+        import asyncio
+
+        # Request parse from OpenDota — this triggers GC data fetch (cluster/salt)
+        try:
+            await self.opendota.request_parse(match_id)
+        except Exception as e:
+            logger.warning(f"Request parse failed for {match_id}: {e}")
+
+        # Poll for cluster/salt to become available (GC data can take a few seconds)
+        replay_url = None
+        for attempt in range(10):
+            await asyncio.sleep(3)
+            od_refreshed = await self.opendota.get_match(match_id)
+            if od_refreshed:
+                cluster = od_refreshed.get("cluster")
+                salt = od_refreshed.get("replay_salt")
+                if cluster and salt:
+                    replay_url = f"http://replay{cluster}.valve.net/570/{match_id}_{salt}.dem.bz2"
+                    logger.info(f"Replay URL resolved on attempt {attempt + 1}: {replay_url}")
+                    break
+            logger.info(f"Waiting for replay salt (attempt {attempt + 1}/10)...")
+
+        if not replay_url:
+            logger.warning(f"Cannot resolve replay URL for match {match_id} after 10 attempts")
+            return None
+
+        parser_url = os.environ.get("PARSER_URL", "http://localhost:5600")
+        blob_url = f"{parser_url}/blob?replay_url={replay_url}"
+        logger.info(f"Calling parser /blob for match {match_id}")
+
+        try:
+            async with _httpx.AsyncClient(timeout=300) as client:
+                resp = await client.get(blob_url)
+                resp.raise_for_status()
+                data = resp.json()
+                if data and data.get("teamfights"):
+                    self.storage.store_raw_match(match_id, data, source="parsed")
+                    return data
+                logger.warning(f"Parser returned empty data for {match_id}")
+                return None
+        except Exception as e:
+            logger.error(f"Parser /blob failed for {match_id}: {e}")
+            return None
+        
+    def _build_replay_url(self, od_data: dict) -> str | None:
+        cluster = od_data.get("cluster")
+        salt = od_data.get("replay_salt")
+        if not cluster or not salt:
+            return None
+        return f"http://replay{cluster}.valve.net/570/{od_data['match_id']}_{salt}.dem.bz2"
+    
 
     async def close(self):
         await self.opendota.close()

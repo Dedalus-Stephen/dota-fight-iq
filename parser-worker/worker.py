@@ -1,7 +1,27 @@
-import os, subprocess, json, sys, tempfile
+"""
+Parser Worker — downloads and parses Dota 2 replays via odota/parser's /blob endpoint.
+
+The /blob endpoint handles everything: download, decompress, parse, and assemble
+into the same structured JSON that OpenDota's API returns (teamfights, players, etc.)
+
+Architecture:
+  - Cloud Tasks sends {match_id, replay_url, job_id} to POST /parse
+  - This worker forwards replay_url to the odota/parser container's /blob endpoint
+  - The assembled JSON is uploaded to GCS
+  - parse_jobs table is updated for frontend status polling
+"""
+
+import os, json, sys
+from datetime import datetime, timezone
 import httpx
 from google.cloud import storage
 from supabase import create_client
+
+
+# The odota/parser container runs as a sidecar or separate service
+# In production on Cloud Run, this would be an internal service URL
+PARSER_URL = os.environ.get("PARSER_URL", "http://localhost:5600")
+PARSER_TIMEOUT = int(os.environ.get("PARSER_TIMEOUT", "300"))
 
 
 def update_job_status(sb, job_id: str, status: str, error: str | None = None):
@@ -9,13 +29,11 @@ def update_job_status(sb, job_id: str, status: str, error: str | None = None):
     if error:
         payload["error"] = error[:500]
     if status in ("complete", "failed"):
-        from datetime import datetime, timezone
         payload["completed_at"] = datetime.now(timezone.utc).isoformat()
     sb.table("parse_jobs").update(payload).eq("job_id", job_id).execute()
 
 
 def main():
-    # Read env vars inside main() — NOT at module level
     match_id     = int(os.environ["MATCH_ID"])
     replay_url   = os.environ["REPLAY_URL"]
     job_id       = os.environ.get("JOB_ID", "")
@@ -32,45 +50,32 @@ def main():
     update_job_status(sb, job_id, "parsing")
 
     try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            replay_path = f"{tmpdir}/{match_id}.dem.bz2"
-            dem_path    = f"{tmpdir}/{match_id}.dem"
+        # Call the parser's /blob endpoint — it handles download, decompress, parse, assembly
+        blob_url = f"{PARSER_URL}/blob?replay_url={replay_url}"
+        print(f"Requesting parse for match {match_id}: {blob_url}")
 
-            # 1. Download replay from Valve CDN
-            print(f"Downloading replay for match {match_id}...")
-            with httpx.stream("GET", replay_url, follow_redirects=True, timeout=120) as r:
-                r.raise_for_status()
-                with open(replay_path, "wb") as f:
-                    for chunk in r.iter_bytes(chunk_size=65536):
-                        f.write(chunk)
+        with httpx.Client(timeout=PARSER_TIMEOUT) as client:
+            resp = client.get(blob_url)
+            resp.raise_for_status()
 
-            # 2. Decompress
-            subprocess.run(["bunzip2", "-k", replay_path], check=True)
+        parsed = resp.json()
 
-            # 3. Parse with odota/parser JAR
-            print("Parsing replay...")
-            result = subprocess.run(
-                ["java", "-jar", "/app/parser.jar", dem_path],
-                capture_output=True, text=True, timeout=600 # <--- This might be too short
-            )
-            if result.returncode != 0:
-                raise RuntimeError(f"Parser JAR failed: {result.stderr[:500]}")
+        if not parsed or not parsed.get("teamfights"):
+            raise RuntimeError("Parser returned empty or invalid data")
 
-            # 4. Assemble NDJSON into structured match object
-            events = [
-                json.loads(line)
-                for line in result.stdout.strip().splitlines()
-                if line
-            ]
-            parsed = assemble_parsed_match(events)
+        # Inject match_id (parser doesn't know it from the replay alone)
+        parsed["match_id"] = match_id
 
-            # 5. Upload to GCS
-            blob = bucket.blob(gcs_output_key)
-            blob.upload_from_string(
-                json.dumps(parsed),
-                content_type="application/json"
-            )
-            print(f"Uploaded to gs://{gcs_bucket}/{gcs_output_key}")
+        print(f"Parse complete: {len(parsed.get('teamfights', []))} teamfights, "
+              f"{len(parsed.get('players', []))} players")
+
+        # Upload to GCS
+        blob = bucket.blob(gcs_output_key)
+        blob.upload_from_string(
+            json.dumps(parsed),
+            content_type="application/json"
+        )
+        print(f"Uploaded to gs://{gcs_bucket}/{gcs_output_key}")
 
         update_job_status(sb, job_id, "complete")
 
@@ -78,19 +83,6 @@ def main():
         print(f"Parse failed: {e}", file=sys.stderr)
         update_job_status(sb, job_id, "failed", error=str(e))
         raise
-
-
-def assemble_parsed_match(events: list[dict]) -> dict:
-    result = {"teamfights": [], "players": [], "objectives": [], "chat": []}
-    for event in events:
-        t = event.get("type")
-        if t == "teamfight":
-            result["teamfights"].append(event)
-        elif t == "objectives":
-            result["objectives"].append(event)
-        elif t == "chat":
-            result["chat"].append(event)
-    return result
 
 
 if __name__ == "__main__":
