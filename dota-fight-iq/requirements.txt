@@ -26,3 +26,8 @@ pandas==3.0.1
 python-dotenv==1.0.1
 orjson==3.11.7
 tenacity==9.0.0
+
+# Steam GC retriever (replay URL resolution)
+steam>=1.4.4
+dota2>=1.1.0
+gevent>=25.9.1
